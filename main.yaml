@@ -1,0 +1,229 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation Template para EC2 com Auto Scaling, ALB e DynamoDb'
+
+Parameters:
+  KeyName:
+    Description: 'Nome da chave SSH para acesso às instâncias'
+    Type: 'AWS::EC2::KeyPair::KeyName'
+    Default: 'KeyPairA'
+
+Resources:
+  VPCProj:
+    Type: AWS::EC2::VPC
+    Properties: 
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: 'true'
+      EnableDnsHostnames: 'true'
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties: 
+      VpcId: !Ref VPCProj
+      CidrBlock: 10.0.1.0/24
+  
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties: 
+      VpcId: !Ref VPCProj
+      CidrBlock: 10.0.2.0/24
+  
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties: 
+      VpcId: !Ref VPCProj
+      CidrBlock: 10.0.3.0/24
+    
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties: 
+      VpcId: !Ref VPCProj
+      CidrBlock: 10.0.4.0/24
+
+  IGW:
+    Type: AWS::EC2::InternetGateway
+
+  AttachIGW:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties: 
+      VpcId: !Ref VPCProj
+      InternetGatewayId: !Ref IGW
+
+  RT:
+    Type: AWS::EC2::RouteTable
+    Properties: 
+      VpcId: !Ref VPCProj
+  
+  RTtoIGW:
+    Type: AWS::EC2::Route
+    DependsOn: IGW  
+    Properties: 
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref IGW
+      RouteTableId: !Ref RT
+
+  RTAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: 
+      RouteTableId: !Ref RT
+      SubnetId: !Ref PublicSubnetA
+
+  InstanceSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: 'Permitir acesso HTTP e SSH'
+      VpcId: !Ref VPCProj
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+  DynamoDbSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: 'Permitir acesso de EC2 ao DynamoDb'
+      VpcId: !Ref VPCProj
+      SecurityGroupIngress:
+        - IpProtocol: -1
+          SourceSecurityGroupId: !Ref InstanceSecurityGroup
+
+  LaunchConfiguration:
+    Type: 'AWS::AutoScaling::LaunchConfiguration'
+    Properties:
+      ImageId: ami-0bb84b8ffd87024d8
+      InstanceType: t2.micro
+      KeyName: !Ref KeyName  
+      SecurityGroups:
+        - !Ref InstanceSecurityGroup
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          # Comandos de inicialização da aplicação
+
+  AutoScalingGroup:
+    Type: 'AWS::AutoScaling::AutoScalingGroup'
+    Properties:
+      VPCZoneIdentifier:
+        - !Ref PublicSubnetA
+        - !Ref PublicSubnetB
+      LaunchConfigurationName: !Ref LaunchConfiguration
+      MinSize: '1'
+      MaxSize: '3'
+      DesiredCapacity: '2'
+      TargetGroupARNs:
+        - !Ref TargetGroup
+      HealthCheckType: 'EC2'
+      HealthCheckGracePeriod: 300
+
+  ScaleUpPolicy:
+    Type: 'AWS::AutoScaling::ScalingPolicy'
+    Properties:
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      PolicyType: 'SimpleScaling'
+      AdjustmentType: ChangeInCapacity
+      ScalingAdjustment: 1
+      Cooldown: 300
+
+  ScaleDownPolicy:
+    Type: 'AWS::AutoScaling::ScalingPolicy'
+    Properties:
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      PolicyType: 'SimpleScaling'
+      AdjustmentType: ChangeInCapacity
+      ScalingAdjustment: -1
+      Cooldown: 300
+
+  CPUAlarmHigh:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmDescription: 'Alarme para escalar instâncias quando a CPU ultrapassar 70%'
+      MetricName: 'CPUUtilization'
+      Namespace: 'AWS/EC2'
+      Statistic: 'Average'
+      Period: '300'
+      EvaluationPeriods: '1'
+      Threshold: '70'
+      ComparisonOperator: 'GreaterThanThreshold'
+      AlarmActions:
+        - !Ref ScaleUpPolicy
+      Dimensions:
+        - Name: 'AutoScalingGroupName'
+          Value: !Ref AutoScalingGroup
+
+  CPUAlarmLow:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmDescription: 'Alarme para desescalar instâncias quando a CPU estiver abaixo de 20%'
+      MetricName: 'CPUUtilization'
+      Namespace: 'AWS/EC2'
+      Statistic: 'Average'
+      Period: '300'
+      EvaluationPeriods: '1'
+      Threshold: '20'
+      ComparisonOperator: 'LessThanThreshold'
+      AlarmActions:
+        - !Ref ScaleDownPolicy
+      Dimensions:
+        - Name: 'AutoScalingGroupName'
+          Value: !Ref AutoScalingGroup
+
+  LoadBalancer:
+    Type: 'AWS::ElasticLoadBalancingV2::LoadBalancer'
+    Properties:
+      Name: 'ApplicationLoadBalancer'
+      Subnets:
+        - !Ref PublicSubnetA
+        - !Ref PublicSubnetB
+      SecurityGroups:
+        - !Ref InstanceSecurityGroup
+      Scheme: 'internet-facing'
+
+  TargetGroup:
+    Type: 'AWS::ElasticLoadBalancingV2::TargetGroup'
+    Properties:
+      HealthCheckIntervalSeconds: 30
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 5
+      UnhealthyThresholdCount: 2
+      Matcher:
+        HttpCode: 200
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref VPCProj
+
+  LoadBalancerListener:
+    Type: 'AWS::ElasticLoadBalancingV2::Listener'
+    Properties:
+      DefaultActions:
+        - Type: 'forward'
+          TargetGroupArn: !Ref TargetGroup
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+  DynamoDBTable:
+    Type: 'AWS::DynamoDB::Table'
+    Properties:
+      TableName: 'MyDynamoDBTable'
+      AttributeDefinitions:
+        - AttributeName: 'Id'
+          AttributeType: 'S'
+      KeySchema:
+        - AttributeName: 'Id'
+          KeyType: 'HASH'
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: 'Name'
+          Value: 'MyDynamoDBTable'
+
+
